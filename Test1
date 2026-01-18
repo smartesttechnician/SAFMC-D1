@@ -1,0 +1,225 @@
+/*
+  ESP32 -> SBUS transmitter (Betaflight receiver emulation)
+
+  Features:
+  - 16ch SBUS output @ 100Hz
+  - CH1 roll, CH2 pitch, CH3 throttle, CH4 yaw
+  - 2 buttons: UP/DOWN adjusts throttle target
+  - Optional deadman button: if not held, outputs safe neutral + low throttle
+  - Optional MPU6050: maps wrist tilt to roll/pitch, and gyro Z to yaw rate
+
+  Wiring:
+  - ESP32 TX_PIN -> (INVERTER) -> FC SBUS input pad (or non-inverted UART RX if available)
+  - Buttons to GND with internal pullups enabled
+
+  Libraries:
+  - For MPU6050: install "MPU6050" by Electronic Cats or Jeff Rowberg (I2Cdev)
+  - If you don't have an IMU, set USE_MPU6050 = 0
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ---------- USER CONFIG ----------
+#define USE_MPU6050 0   // set to 1 if you have MPU6050 connected
+// SBUS output pin (ESP32 TX). Pick a pin that supports UART TX.
+static const int TX_PIN = 17;
+
+// Buttons (to GND). Internal pullups enabled.
+static const int BTN_UP_PIN     = 25;
+static const int BTN_DOWN_PIN   = 26;
+static const int BTN_DEADMAN_PIN = 27; // optional; set to -1 to disable
+
+// Throttle behavior
+static const int SBUS_MIN = 172;   // SBUS low end
+static const int SBUS_MID = 992;   // SBUS mid
+static const int SBUS_MAX = 1811;  // SBUS high end
+
+// For Betaflight: throttle low should be truly low for safety.
+static const int THROTTLE_IDLE = 200;     // disarmed / deadman not held
+static const int THROTTLE_HOVER_GUESS = 1100; // initial guess (tune carefully)
+static const int THROTTLE_STEP = 12;      // per update step
+static const int THROTTLE_CLIMB_DELTA = 250;  // max delta above hover
+static const int THROTTLE_DESC_DELTA  = 250;  // max delta below hover
+
+// Channel mapping
+// CH1 Roll, CH2 Pitch, CH3 Throttle, CH4 Yaw, CH5 Arm, CH6 Mode
+static const int CH_ARM  = 5;
+static const int CH_MODE = 6;
+
+// Set these for your preferred defaults
+static const bool DEFAULT_ARM = false;
+static const bool DEFAULT_ANGLE_MODE = true; // e.g. ANGLE mode switch high
+
+// Update rate
+static const uint32_t SBUS_PERIOD_US = 10000; // 100Hz = 10ms
+
+// ---------- OPTIONAL MPU6050 ----------
+#if USE_MPU6050
+  #include <MPU6050.h>
+  MPU6050 mpu;
+#endif
+
+// ---------- SBUS PACKING ----------
+static HardwareSerial SBusSerial(2); // UART2
+static uint16_t ch[16];
+static uint8_t sbusFrame[25];
+
+static inline uint16_t clamp16(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return (uint16_t)v;
+}
+
+// Pack 16 channels (11-bit each) into SBUS frame
+static void sbusPack(uint16_t channels[16], bool failsafe=false, bool frameLost=false) {
+  // SBUS protocol: 25 bytes
+  // [0]=0x0F, [1..22]=data, [23]=flags, [24]=0x00
+  memset(sbusFrame, 0, sizeof(sbusFrame));
+  sbusFrame[0] = 0x0F;
+
+  // Ensure 11-bit range
+  uint16_t c[16];
+  for (int i = 0; i < 16; i++) c[i] = channels[i] & 0x07FF;
+
+  sbusFrame[1]  = (uint8_t)( c[0]       & 0xFF);
+  sbusFrame[2]  = (uint8_t)((c[0] >> 8) | ((c[1] & 0x07) << 3));
+  sbusFrame[3]  = (uint8_t)((c[1] >> 5) | ((c[2] & 0x3F) << 6));
+  sbusFrame[4]  = (uint8_t)((c[2] >> 2) & 0xFF);
+  sbusFrame[5]  = (uint8_t)((c[2] >>10) | ((c[3] & 0x1FF) << 1));
+  sbusFrame[6]  = (uint8_t)((c[3] >> 7) | ((c[4] & 0x0F) << 4));
+  sbusFrame[7]  = (uint8_t)((c[4] >> 4) | ((c[5] & 0x7F) << 7));
+  sbusFrame[8]  = (uint8_t)((c[5] >> 1) & 0xFF);
+  sbusFrame[9]  = (uint8_t)((c[5] >> 9) | ((c[6] & 0x03) << 2) | ((c[7] & 0x1F) << 5));
+  sbusFrame[10] = (uint8_t)((c[7] >> 3) & 0xFF);
+  sbusFrame[11] = (uint8_t)((c[7] >>11) | ((c[8] & 0xFF) << 0));
+  sbusFrame[12] = (uint8_t)((c[8] >> 8) | ((c[9] & 0x07) << 3));
+  sbusFrame[13] = (uint8_t)((c[9] >> 5) | ((c[10] & 0x3F) << 6));
+  sbusFrame[14] = (uint8_t)((c[10] >>2) & 0xFF);
+  sbusFrame[15] = (uint8_t)((c[10]>>10) | ((c[11] & 0x1FF) << 1));
+  sbusFrame[16] = (uint8_t)((c[11]>> 7) | ((c[12] & 0x0F) << 4));
+  sbusFrame[17] = (uint8_t)((c[12]>> 4) | ((c[13] & 0x7F) << 7));
+  sbusFrame[18] = (uint8_t)((c[13]>> 1) & 0xFF);
+  sbusFrame[19] = (uint8_t)((c[13]>> 9) | ((c[14] & 0x03) << 2) | ((c[15] & 0x1F) << 5));
+  sbusFrame[20] = (uint8_t)((c[15]>> 3) & 0xFF);
+  sbusFrame[21] = (uint8_t)((c[15]>>11));
+
+  uint8_t flags = 0x00;
+  if (frameLost) flags |= (1 << 2);
+  if (failsafe)  flags |= (1 << 3);
+  sbusFrame[23] = flags;
+  sbusFrame[24] = 0x00;
+}
+
+static void sbusSend() {
+  SBusSerial.write(sbusFrame, sizeof(sbusFrame));
+}
+
+// Map -1..+1 to SBUS range around mid
+static uint16_t mapCentered(float x, int range=400) {
+  // range is half-range around mid in SBUS units
+  x = constrain(x, -1.0f, 1.0f);
+  int v = SBUS_MID + (int)(x * range);
+  return clamp16(v, SBUS_MIN, SBUS_MAX);
+}
+
+void setup() {
+  pinMode(BTN_UP_PIN, INPUT_PULLUP);
+  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+  if (BTN_DEADMAN_PIN >= 0) pinMode(BTN_DEADMAN_PIN, INPUT_PULLUP);
+
+  // SBUS UART: 100000 baud, 8E2
+  // NOTE: Signal is non-inverted from ESP32. Use external inverter if FC expects inverted SBUS.
+  SBusSerial.begin(100000, SERIAL_8E2, -1, TX_PIN);
+
+#if USE_MPU6050
+  Wire.begin();
+  mpu.initialize();
+#endif
+
+  // Initialize channels to neutral
+  for (int i = 0; i < 16; i++) ch[i] = SBUS_MID;
+  ch[2] = THROTTLE_IDLE; // throttle low
+  ch[CH_ARM-1]  = DEFAULT_ARM ? SBUS_MAX : SBUS_MIN;
+  ch[CH_MODE-1] = DEFAULT_ANGLE_MODE ? SBUS_MAX : SBUS_MIN;
+}
+
+void loop() {
+  static uint32_t lastSend = 0;
+  static int throttleTarget = THROTTLE_HOVER_GUESS;
+  static int throttleOut = THROTTLE_IDLE;
+
+  // Read buttons (active low)
+  bool up    = (digitalRead(BTN_UP_PIN) == LOW);
+  bool down  = (digitalRead(BTN_DOWN_PIN) == LOW);
+  bool dead  = true;
+  if (BTN_DEADMAN_PIN >= 0) dead = (digitalRead(BTN_DEADMAN_PIN) == LOW);
+
+  // ---------- IMU -> roll/pitch/yaw (optional) ----------
+  float rollCmd = 0.0f, pitchCmd = 0.0f, yawCmd = 0.0f;
+
+#if USE_MPU6050
+  // Very basic example. You should implement proper attitude estimation for real use.
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // crude tilt from accel
+  float fax = (float)ax, fay = (float)ay, faz = (float)az;
+  float roll  = atan2f(fay, faz);
+  float pitch = atan2f(-fax, sqrtf(fay*fay + faz*faz));
+
+  // map tilt radians to command
+  // ~0.35 rad (~20deg) -> full command
+  rollCmd  = constrain(roll / 0.35f,  -1.0f, 1.0f);
+  pitchCmd = constrain(pitch / 0.35f, -1.0f, 1.0f);
+
+  // yaw rate from gyro Z (scale depends on sensor settings)
+  yawCmd = constrain((float)gz / 8000.0f, -1.0f, 1.0f);
+#endif
+
+  // ---------- Throttle logic ----------
+  // If no deadman, force safe outputs
+  if (!dead) {
+    // Safe: neutral sticks + low throttle
+    rollCmd = pitchCmd = yawCmd = 0.0f;
+    throttleTarget = THROTTLE_HOVER_GUESS;
+    throttleOut = THROTTLE_IDLE;
+  } else {
+    // Adjust throttle target up/down (rate-limited steps)
+    int minT = THROTTLE_HOVER_GUESS - THROTTLE_DESC_DELTA;
+    int maxT = THROTTLE_HOVER_GUESS + THROTTLE_CLIMB_DELTA;
+
+    if (up && !down) {
+      throttleTarget += THROTTLE_STEP;
+    } else if (down && !up) {
+      throttleTarget -= THROTTLE_STEP;
+    } else {
+      // no buttons: gently return toward hover guess
+      if (throttleTarget > THROTTLE_HOVER_GUESS) throttleTarget -= THROTTLE_STEP;
+      if (throttleTarget < THROTTLE_HOVER_GUESS) throttleTarget += THROTTLE_STEP;
+    }
+    throttleTarget = constrain(throttleTarget, minT, maxT);
+
+    // Smooth throttle output to target
+    int slew = 10; // max change per loop
+    if (throttleOut < throttleTarget) throttleOut = min(throttleOut + slew, throttleTarget);
+    if (throttleOut > throttleTarget) throttleOut = max(throttleOut - slew, throttleTarget);
+  }
+
+  // ---------- Fill SBUS channels ----------
+  ch[0] = mapCentered(rollCmd,  350); // roll
+  ch[1] = mapCentered(pitchCmd, 350); // pitch
+  ch[2] = clamp16(throttleOut, SBUS_MIN, SBUS_MAX); // throttle
+  ch[3] = mapCentered(yawCmd,   350); // yaw
+
+  // CH5 ARM and CH6 MODE are static in this minimal sketch
+  // You can map them to extra buttons/gestures later.
+
+  // ---------- Send SBUS at 100Hz ----------
+  uint32_t now = micros();
+  if (now - lastSend >= SBUS_PERIOD_US) {
+    lastSend = now;
+    sbusPack(ch, false, false);
+    sbusSend();
+  }
+}
