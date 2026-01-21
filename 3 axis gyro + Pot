@@ -1,0 +1,62 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050_tockn.h>
+
+static const int POT_PIN = 34;      // ADC1 pin for throttle
+static const int POT_SAMPLES = 16;  // smoothing for throttle
+
+MPU6050 mpu(Wire);
+
+int readPotAvg(int pin) {
+  long sum = 0;
+  for (int i = 0; i < POT_SAMPLES; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(500);
+  }
+  return (int)(sum / POT_SAMPLES);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // --- Pot setup ---
+  analogReadResolution(12); // 0..4095
+  analogSetPinAttenuation(POT_PIN, ADC_11db); // ~0–3.3V range
+
+  // --- MPU6050 setup ---
+  Wire.begin(21, 22); // SDA, SCL for ESP32
+  mpu.begin();
+
+  Serial.println("Keep MPU6050 still… calibrating gyro offsets.");
+  mpu.calcGyroOffsets(true);
+
+  Serial.println("Ready: Throttle + Pitch/Roll/Yaw");
+}
+
+void loop() {
+  // ---- Throttle (pot) ----
+  int raw = readPotAvg(POT_PIN);              // ~0..4095
+  float throttle = (raw / 4095.0f) * 100.0f;  // %
+
+  // ---- IMU (MPU6050) ----
+  mpu.update();
+  float pitch = mpu.getAngleX();
+  float roll  = mpu.getAngleY();
+  float yaw   = mpu.getAngleZ(); // will drift (MPU6050 has no magnetometer)
+
+  // ---- Print ----
+  Serial.print("Throttle: ");
+  Serial.print(throttle, 1);
+  Serial.print("% (raw ");
+  Serial.print(raw);
+  Serial.print(") | Pitch: ");
+  Serial.print(pitch, 2);
+  Serial.print(" Roll: ");
+  Serial.print(roll, 2);
+  Serial.print(" Yaw: ");
+  Serial.print(yaw, 2);
+  Serial.println();
+
+  delay(20); // ~50 Hz update rate
+}
