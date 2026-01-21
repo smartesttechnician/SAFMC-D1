@@ -1,0 +1,18 @@
+#include <Arduino.h>
+
+const int POT_PIN = 34; 
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);                 
+  analogSetPinAttenuation(POT_PIN, ADC_11db); // ~0–3.3V 10k pot
+}
+
+void loop() {
+  int raw = analogRead(POT_PIN);           
+  float throttle = (raw / 4095.0f) * 100.0f;
+  Serial.print("Throttle: ");
+  Serial.print(throttle, 1);
+  Serial.println("%");
+  delay(100); //how fast serial update
+}
