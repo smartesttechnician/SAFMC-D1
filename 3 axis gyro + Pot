@@ -2,8 +2,8 @@
 #include <Wire.h>
 #include <MPU6050_tockn.h>
 
-static const int POT_PIN = 34;      // ADC1 pin for throttle
-static const int POT_SAMPLES = 16;  // smoothing for throttle
+static const int POT_PIN = 34;
+static const int POT_SAMPLES = 6;
 
 MPU6050 mpu(Wire);
 
@@ -11,41 +11,96 @@ int readPotAvg(int pin) {
   long sum = 0;
   for (int i = 0; i < POT_SAMPLES; i++) {
     sum += analogRead(pin);
-    delayMicroseconds(500);
+    delayMicroseconds(40);
   }
   return (int)(sum / POT_SAMPLES);
 }
 
+static inline float rad2deg(float r) { return r * 57.2957795f; }
+
+float pitch0 = 0, roll0 = 0, yaw0 = 0;
+float yawDeg = 0;
+unsigned long lastUs = 0;
+
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(300);
 
-  // --- Pot setup ---
-  analogReadResolution(12); // 0..4095
-  analogSetPinAttenuation(POT_PIN, ADC_11db); // ~0–3.3V range
+  // Pot
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
 
-  // --- MPU6050 setup ---
-  Wire.begin(21, 22); // SDA, SCL for ESP32
+  // I2C (MPU powered from 3.3V)
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
   mpu.begin();
 
-  Serial.println("Keep MPU6050 still… calibrating gyro offsets.");
+  Serial.println("Warming up (keep still)...");
+  for (int i = 0; i < 200; i++) { mpu.update(); delay(10); }
+
+  Serial.println("Calibrating gyro offsets (DO NOT MOVE)...");
   mpu.calcGyroOffsets(true);
 
-  Serial.println("Ready: Throttle + Pitch/Roll/Yaw");
+  // Capture zero baseline using accel-based pitch/roll and gyro yaw
+  Serial.println("Capturing zero (still)...");
+  float sp = 0, sr = 0;
+  const int N = 80;
+  for (int i = 0; i < N; i++) {
+    mpu.update();
+
+    float ax = mpu.getAccX();
+    float ay = mpu.getAccY();
+    float az = mpu.getAccZ();
+
+    // Pitch/Roll from accelerometer (in degrees)
+    float pitch = rad2deg(atan2f(-ax, sqrtf(ay * ay + az * az)));
+    float roll  = rad2deg(atan2f( ay, az ));
+
+    sp += pitch;
+    sr += roll;
+
+    delay(5);
+  }
+  pitch0 = sp / N;
+  roll0  = sr / N;
+
+  yawDeg = 0.0f;
+  yaw0 = 0.0f; // yaw will be relative anyway
+
+  lastUs = micros();
+
+  Serial.println("Ready: starts at 0,0,0 (Pitch/Roll accel, Yaw gyro-integrated)");
 }
 
 void loop() {
-  // ---- Throttle (pot) ----
-  int raw = readPotAvg(POT_PIN);              // ~0..4095
-  float throttle = (raw / 4095.0f) * 100.0f;  // %
-
-  // ---- IMU (MPU6050) ----
   mpu.update();
-  float pitch = mpu.getAngleX();
-  float roll  = mpu.getAngleY();
-  float yaw   = mpu.getAngleZ(); // will drift (MPU6050 has no magnetometer)
 
-  // ---- Print ----
+  // time step for yaw integration
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastUs) / 1000000.0f;
+  lastUs = nowUs;
+
+  // Throttle
+  int raw = readPotAvg(POT_PIN);
+  float throttle = (raw / 4095.0f) * 100.0f;
+
+  // Accel readings (g)
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  // Stable pitch/roll from accel
+  float pitch = -rad2deg(atan2f(-ax, sqrtf(ay * ay + az * az))) - pitch0;
+  float roll  = rad2deg(atan2f( ay, az )) - roll0;
+
+  // Yaw from gyro Z rate integration (deg/s * s = deg)
+  float gz = mpu.getGyroZ();      // deg/s (in this library)
+  yawDeg += gz * dt;              // relative yaw
+
+  // OPTIONAL: swap pitch and yaw if you still want that mapping
+  // float tmp = pitch; pitch = yawDeg; yawDeg = tmp;
+
   Serial.print("Throttle: ");
   Serial.print(throttle, 1);
   Serial.print("% (raw ");
@@ -55,11 +110,12 @@ void loop() {
   Serial.print(" Roll: ");
   Serial.print(roll, 2);
   Serial.print(" Yaw: ");
-  Serial.print(yaw, 2);
+  Serial.print(yawDeg, 2);
   Serial.println();
 
-  delay(20); // ~50 Hz update rate
+  delay(10);
 }
+
 // ESP32 GPIO21 (SDA) → MPU6050 SDA
 
 // ESP32 GPIO22 (SCL) → MPU6050 SCL
