@@ -66,7 +66,7 @@ void setup() {
   roll0  = sr / N;
 
   yawDeg = 0.0f;
-  yaw0 = 0.0f; // yaw will be relative anyway
+  yaw0 = 0.0f; 
 
   lastUs = micros();
 
@@ -95,11 +95,8 @@ void loop() {
   float roll  = rad2deg(atan2f( ay, az )) - roll0;
 
   // Yaw from gyro Z rate integration (deg/s * s = deg)
-  float gz = mpu.getGyroZ();      // deg/s (in this library)
+  float gz = mpu.getGyroZ();      // deg/s 
   yawDeg += gz * dt;              // relative yaw
-
-  // OPTIONAL: swap pitch and yaw if you still want that mapping
-  // float tmp = pitch; pitch = yawDeg; yawDeg = tmp;
 
   Serial.print("Throttle: ");
   Serial.print(throttle, 1);
@@ -115,17 +112,12 @@ void loop() {
 
   delay(10);
 }
-
+// Pin connections/Comments 
+// If you made it this far, please note that since the MPU6050 is a 6 axis sensor the yaw will drift meaning after sometime readings will NOT be accurate 
 // ESP32 GPIO21 (SDA) → MPU6050 SDA
-
 // ESP32 GPIO22 (SCL) → MPU6050 SCL
-
 // ESP32 3.3V → MPU6050 VCC (use 3.3V, not 5V, unless your module explicitly supports it)
-
 // ESP32 GND → MPU6050 GND
-
 //Pot one end → ESP32 3.3V
-
 // Pot other end → ESP32 GND
-
 // Pot middle (wiper) → ESP32 GPIO34 (ADC input)
