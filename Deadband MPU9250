@@ -1,173 +1,137 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU9250.h>
-#define POT_PIN 34
-#define CRSF_TX_PIN 17   // ESP32 TX → ELRS TX module RX only need this 
-#define CRSF_RX_PIN 16   //(optional)
-#define CRSF_BAUD 420000
-#define PRINT_INTERVAL_MS 50   // 20 Hz printing
+
+#define POT_PIN           34
+#define CRSF_TX_PIN       17
+#define CRSF_RX_PIN       16
+#define CRSF_BAUD         420000
+#define PRINT_INTERVAL_MS 50
+
+//Tune depending on sensitivity 
+#define ROLL_MAX    45.0f   // degrees
+#define PITCH_MAX   45.0f   // degrees
+#define YAW_RATE_MAX 200.0f // deg/s (gyro rate, no absolute ref for yaw)
+#define DEADBAND    2.0f    // degrees — increase to reduce drift jitter
+#define LPF_ALPHA   0.25f   // 0.0–1.0 — lower = smoother but more lag
+#define CRSF_ADDR_MODULE               0xEE
+#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
+
 MPU9250 mpu;
 HardwareSerial CRSF(2);
 
-// CRSF constants
-#define CRSF_ADDR_MODULE 0xEE
-#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
-
 uint16_t rc[16];
 unsigned long lastPrintMs = 0;
+unsigned long lastLoopUs  = 0;
 
-// Deadband and filter settings
-static inline float applyDeadband(float v, float db) {
-  return (fabsf(v) < db) ? 0.0f : v;
-}
-
-// Low-pass filter state
 static float rFilt = 0, pFilt = 0, yFilt = 0;
-// Tune these:
-// db: 1.5~3.0 deg/s typical
-// alpha: 0.15 smoother
-static const float db = 2.0f;
-static const float alpha = 0.25f;
-
-// CRSF CRC8 (poly 0xD5)
 uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
   uint8_t crc = 0;
   while (len--) {
     crc ^= *ptr++;
-    for (uint8_t i = 0; i < 8; i++) {
+    for (uint8_t i = 0; i < 8; i++)
       crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : (crc << 1);
-    }
   }
   return crc;
 }
 
-// Pack 16 channels (11-bit) into CRSF payload
 void crsf_pack_channels(uint8_t *payload) {
   uint32_t bitbuf = 0;
-  uint8_t bits = 0;
-  uint8_t idx = 0;
-
+  uint8_t  bits = 0, idx = 0;
   for (int ch = 0; ch < 16; ch++) {
     bitbuf |= ((uint32_t)rc[ch]) << bits;
     bits += 11;
-
     while (bits >= 8) {
       payload[idx++] = bitbuf & 0xFF;
       bitbuf >>= 8;
-      bits -= 8;
+      bits   -= 8;
     }
   }
 }
 
-// Send CRSF RC frame
 void sendCRSF() {
-  uint8_t payload[22];
-  uint8_t frame[26];
-
+  uint8_t payload[22], frame[26];
   crsf_pack_channels(payload);
-
   frame[0] = CRSF_ADDR_MODULE;
-  frame[1] = 24; // type + payload + crc
+  frame[1] = 24;
   frame[2] = CRSF_FRAMETYPE_RC_CHANNELS_PACKED;
-
   memcpy(&frame[3], payload, 22);
   frame[25] = crsf_crc8(&frame[2], 23);
-
   CRSF.write(frame, 26);
 }
 
-// Map float to CRSF range (172–1811)
 uint16_t mapToCRSF(float v, float minV, float maxV) {
   v = constrain(v, minV, maxV);
-  return map((int)(v * 1000), (int)(minV * 1000), (int)(maxV * 1000), 172, 1811);
+  return (uint16_t)map((long)(v * 1000), (long)(minV * 1000),
+                       (long)(maxV * 1000), 172, 1811);
 }
 
-// ------------------------------------------------
+uint16_t mapWithDeadband(float v, float maxV) {
+  if (fabsf(v) < DEADBAND) return 992;
+  float sign = (v > 0) ? 1.0f : -1.0f;
+  v = sign * (fabsf(v) - DEADBAND);
+  return mapToCRSF(v, -(maxV - DEADBAND), (maxV - DEADBAND));
+}
 
 void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // UART to ELRS TX module
   CRSF.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
 
-  // ADC
   analogReadResolution(12);
   analogSetPinAttenuation(POT_PIN, ADC_11db);
 
-  // I2C
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
-  // MPU9250
-  if (!mpu.setup(0x68)) {  // 0x68 default; use 0x69 if AD0 is high
-    Serial.println("MPU9250 not found at 0x68. Check wiring / address.");
-    while (1) { delay(100); }
+  if (!mpu.setup(0x68)) {
+    Serial.println("MPU9250 not found — check wiring/address (0x68 or 0x69)");
+    while (1) delay(100);
   }
 
-  Serial.println("MPU9250 ready. Keep still for a moment...");
+  Serial.println("MPU9250 calibrating pls dont move");
   delay(500);
+  Serial.println("Done. rc[4] = 172 → DISARMED. Change to 1811 to arm.");
 }
 
-// ------------------------------------------------
-
 void loop() {
+  // Non-blocking 500 Hz
+  unsigned long now = micros();
+  if (now - lastLoopUs < 2000) return;
+  lastLoopUs = now;
+
   mpu.update();
 
-  // Raw gyro (deg/s)
-  float r = mpu.getGyroX();
-  float p = mpu.getGyroY();
-  float y = mpu.getGyroZ();
+ 
+  float roll  = mpu.getRoll();
+  float pitch = mpu.getPitch();
+  float yawRate = mpu.getGyroZ();
+  //Low-pass filter adjust sensitivity at the top 
+  rFilt += LPF_ALPHA * (roll     - rFilt);
+  pFilt += LPF_ALPHA * (pitch    - pFilt);
+  yFilt += LPF_ALPHA * (yawRate  - yFilt);
 
-  // Deadband
-  r = applyDeadband(r, db);
-  p = applyDeadband(p, db);
-  y = applyDeadband(y, db);
-
-  // Simple low-pass
-  rFilt += alpha * (r - rFilt);
-  pFilt += alpha * (p - pFilt);
-  yFilt += alpha * (y - yFilt);
-
-  float rollRate  = rFilt;
-  float pitchRate = pFilt;
-  float yawRate   = yFilt;
-
-  // Throttle
+  //Throttle
   float throttle = analogRead(POT_PIN) / 4095.0f;
 
-  // Map to RC channels
-  rc[0] = mapToCRSF( rollRate,  -200, 200);   // Roll
-  rc[1] = mapToCRSF( pitchRate, -200, 200);   // Pitch
-  rc[2] = map((int)(throttle * 1000), 0, 1000, 172, 1811); // Throttle
-  rc[3] = mapToCRSF( yawRate,   -200, 200);   // Yaw
-
-  rc[4] = 172;  // AUX1 low (DISARM) 
-//rc[4] = 1811 // when need to arm props PLS CHANGE
+  //Pack channels pls look at RC
+  rc[0] = mapWithDeadband(rFilt, ROLL_MAX);     // Roll
+  rc[1] = mapWithDeadband(pFilt, PITCH_MAX);    // Pitch
+  rc[2] = map((long)(throttle * 1000), 0, 1000, 172, 1811); // Throttle
+  rc[3] = mapWithDeadband(yFilt, YAW_RATE_MAX); // Yaw
+  rc[4] = 172;   // AUX1 --> DISARMED.  Need to change to 1811 to arm
   for (int i = 5; i < 16; i++) rc[i] = 992;
 
   sendCRSF();
 
-  // Debug stuff 
+  // ── Debug print ──
   if (millis() - lastPrintMs > PRINT_INTERVAL_MS) {
     lastPrintMs = millis();
-
-    Serial.print("Gyro R/P/Y (filt): ");
-    Serial.print(rollRate, 1); Serial.print(" / ");
-    Serial.print(pitchRate, 1); Serial.print(" / ");
-    Serial.print(yawRate, 1);
-
-    Serial.print(" | Throttle: ");
-    Serial.print(throttle * 100.0f, 1); Serial.print("%");
-
-    Serial.print(" | RC: ");
-    Serial.print(rc[0]); Serial.print(" ");
-    Serial.print(rc[1]); Serial.print(" ");
-    Serial.print(rc[2]); Serial.print(" ");
-    Serial.print(rc[3]);
-
-    Serial.println();
+    Serial.printf("Angle R/P: %5.1f / %5.1f  YawRate: %6.1f  "
+                  "Thr: %4.1f%%  RC: %4u %4u %4u %4u\n",
+                  rFilt, pFilt, yFilt,
+                  throttle * 100.0f,
+                  rc[0], rc[1], rc[2], rc[3]);
   }
-
-  delayMicroseconds(2000);
 }
