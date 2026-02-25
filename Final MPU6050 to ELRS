@@ -8,7 +8,7 @@
 #define PRINT_INTERVAL_MS 50   
 MPU6050 mpu(Wire);
 HardwareSerial CRSF(2);
-
+// DRONE IS ARMED ADJUST RC 
 // CRSF constants
 #define CRSF_ADDR_MODULE 0xEE
 #define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
@@ -92,7 +92,8 @@ void loop() {
   rc[2] = map(throttle * 1000, 0, 1000, 172, 1811); // Throttle
   rc[3] = mapToCRSF( yawRate,   -200, 200);   // Yaw
 
-  rc[4] = 1811;  // AUX1 (ARM ON — CHANGE THIS!)
+  rc[4] = 1811;  // AUX1 (ARM ON) 
+//rc[4] = 172; // DISARM
   for (int i = 5; i < 16; i++) rc[i] = 992; // neutral
 
   //Send to TX module 
