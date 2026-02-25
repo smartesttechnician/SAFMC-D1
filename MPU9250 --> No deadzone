@@ -3,7 +3,7 @@
 #include <MPU9250.h>
 #define POT_PIN 34
 #define CRSF_TX_PIN 17   // ESP32 TX → ELRS TX module RX
-#define CRSF_RX_PIN 16   // (optional)
+#define CRSF_RX_PIN 16   // (optional) i didnt connect for the mpu6050
 
 #define CRSF_BAUD 420000
 #define PRINT_INTERVAL_MS 50   
