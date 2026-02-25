@@ -76,7 +76,7 @@ void setup() {
   Wire.setClock(400000);
   // MPU6050
   mpu.begin();
-  Serial.println("Calibrating gyro — keep still...");
+  Serial.println("Calibrating gyro pls dont move");
   mpu.calcGyroOffsets(true);
 }
 void loop() {
@@ -119,7 +119,7 @@ void loop() {
 
   delayMicroseconds(2000); // ~500 Hz CRSF
 }
-//ESP32 GPIO17 (TX)  →  TX MODULE RX 
+//ESP32 GPIO17 (TX)  →  TX MODULE RX / csrf tx on transmitter
 //ESP32 GND          →  TX MODULE GND
 
 
