@@ -1,0 +1,146 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU9250.h>
+#define POT_PIN 34
+#define CRSF_TX_PIN 17   // ESP32 TX → ELRS TX module RX
+#define CRSF_RX_PIN 16   // (optional)
+
+#define CRSF_BAUD 420000
+#define PRINT_INTERVAL_MS 50   
+
+MPU9250 mpu;
+HardwareSerial CRSF(2);
+
+// CRSF constants
+#define CRSF_ADDR_MODULE 0xEE
+#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
+
+uint16_t rc[16];
+unsigned long lastPrintMs = 0;
+
+// CRSF CRC8 (poly 0xD5)
+uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *ptr++;
+    for (uint8_t i = 0; i < 8; i++) {
+      crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : (crc << 1);
+    }
+  }
+  return crc;
+}
+
+void crsf_pack_channels(uint8_t *payload) {
+  uint32_t bitbuf = 0;
+  uint8_t bits = 0;
+  uint8_t idx = 0;
+
+  for (int ch = 0; ch < 16; ch++) {
+    bitbuf |= ((uint32_t)rc[ch]) << bits;
+    bits += 11;
+
+    while (bits >= 8) {
+      payload[idx++] = bitbuf & 0xFF;
+      bitbuf >>= 8;
+      bits -= 8;
+    }
+  }
+}
+
+// Send CRSF RC frame
+void sendCRSF() {
+  uint8_t payload[22];
+  uint8_t frame[26];
+
+  crsf_pack_channels(payload);
+
+  frame[0] = CRSF_ADDR_MODULE;
+  frame[1] = 24; // type + payload + crc
+  frame[2] = CRSF_FRAMETYPE_RC_CHANNELS_PACKED;
+
+  memcpy(&frame[3], payload, 22);
+  frame[25] = crsf_crc8(&frame[2], 23);
+
+  CRSF.write(frame, 26);
+}
+
+// Map float to CRSF range (172–1811)
+uint16_t mapToCRSF(float v, float minV, float maxV) {
+  v = constrain(v, minV, maxV);
+  return map((int)(v * 1000), (int)(minV * 1000), (int)(maxV * 1000), 172, 1811);
+}
+
+// ------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // UART to ELRS TX module
+  CRSF.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+
+  // ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
+
+  // I2C
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  // MPU9250
+  if (!mpu.setup(0x68)) {  // 0x68 is default if its wrong can try to change to 0x69 ehh 
+    Serial.println("MPU9250 not found at 0x68. Check wiring / address.");
+    while (1) { delay(100); }
+  }
+
+  Serial.println("CaLiBrAtInG");
+  delay(500);
+}
+
+// ------------------------------------------------
+
+void loop() {
+  // Update MPU9250 
+  mpu.update();
+
+  // ---- Read gyro rates (deg/s) ----
+  float rollRate  = mpu.getGyroX();
+  float pitchRate = mpu.getGyroY();
+  float yawRate   = mpu.getGyroZ();
+
+  // ---- Read throttle pot ----
+  float throttle = analogRead(POT_PIN) / 4095.0f;
+
+  // ---- Map to RC channels ----
+  rc[0] = mapToCRSF( rollRate,  -200, 200);   // Roll
+  rc[1] = mapToCRSF( pitchRate, -200, 200);   // Pitch
+  rc[2] = map((int)(throttle * 1000), 0, 1000, 172, 1811); // Throttle
+  rc[3] = mapToCRSF( yawRate,   -200, 200);   // Yaw
+
+  // PLEASE REMEMBER TO CHANGE THIS PART WHEN DOING AN ARM/DISARM SWITCH 
+  rc[4] = 172;  // AUX1 low (DISARM) 
+//rc[4] = 1811; // Arm drone 
+  for (int i = 5; i < 16; i++) rc[i] = 992; // neutral
+
+  // ---- Send to TX module ----
+  sendCRSF();
+
+ 
+  if (millis() - lastPrintMs > PRINT_INTERVAL_MS) {
+    lastPrintMs = millis();
+    Serial.print("Gyro R/P/Y: ");
+    Serial.print(rollRate, 1); Serial.print(" / ");
+    Serial.print(pitchRate, 1); Serial.print(" / ");
+    Serial.print(yawRate, 1);
+    Serial.print(" | Throttle: ");
+    Serial.print(throttle * 100.0f, 1); Serial.print("%");
+    Serial.print(" | RC: ");
+    Serial.print(rc[0]); Serial.print(" ");
+    Serial.print(rc[1]); Serial.print(" ");
+    Serial.print(rc[2]); Serial.print(" ");
+    Serial.print(rc[3]);
+    Serial.println();
+  }
+
+  delayMicroseconds(2000); 
+}
