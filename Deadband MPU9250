@@ -1,30 +1,48 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU9250.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-#define POT_PIN           34
-#define CRSF_TX_PIN       17
-#define CRSF_RX_PIN       16
-#define CRSF_BAUD         420000
+#define POT_PIN        34
+#define CRSF_TX_PIN    17
+#define CRSF_RX_PIN    16
+#define CRSF_BAUD      420000
 #define PRINT_INTERVAL_MS 50
+#define OLED_UPDATE_MS    1500   // 1.5 second OLED refresh
 
-//Tune depending on sensitivity 
-#define ROLL_MAX    45.0f   // degrees
-#define PITCH_MAX   45.0f   // degrees
-#define YAW_RATE_MAX 200.0f // deg/s (gyro rate, no absolute ref for yaw)
-#define DEADBAND    2.0f    // degrees — increase to reduce drift jitter
-#define LPF_ALPHA   0.25f   // 0.0–1.0 — lower = smoother but more lag
-#define CRSF_ADDR_MODULE               0xEE
-#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
+#define ROLL_MAX       45.0f
+#define PITCH_MAX      45.0f
+#define YAW_MAX        180.0f
+#define DEADBAND       1.5f
+
+#define KILL_SW_PIN    32
+#define MAGNET_SW_PIN  33
+
+// ── OLED config (128x64, I2C address 0x3C) ──────────────────────
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDR      0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 MPU9250 mpu;
 HardwareSerial CRSF(2);
 
-uint16_t rc[16];
-unsigned long lastPrintMs = 0;
-unsigned long lastLoopUs  = 0;
+#define CRSF_ADDR_MODULE                  0xEE
+#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
 
-static float rFilt = 0, pFilt = 0, yFilt = 0;
+uint16_t rc[16];
+unsigned long lastPrintMs  = 0;
+unsigned long lastLoopMs   = 0;
+unsigned long lastOledMs   = 0;
+
+float rollOffset  = 0.0f;
+float pitchOffset = 0.0f;
+float yawOffset   = 0.0f;   // NEW: zero yaw from startup heading
+
+// ─────────────────────────────────────────────────────────────────
+
 uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
   uint8_t crc = 0;
   while (len--) {
@@ -73,11 +91,48 @@ uint16_t mapWithDeadband(float v, float maxV) {
   return mapToCRSF(v, -(maxV - DEADBAND), (maxV - DEADBAND));
 }
 
+// Wrap yaw delta into [-180, 180]
+float wrapYaw(float raw, float offset) {
+  float y = raw - offset;
+  while (y >  180.0f) y -= 360.0f;
+  while (y < -180.0f) y += 360.0f;
+  return y;
+}
+
+void updateOLED(float roll, float pitch, float yaw, float throttle,
+                bool armed, bool magnetOn) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.printf("R: %+.1f", roll);
+
+  display.setCursor(0, 12);
+  display.printf("P: %+.1f", pitch);
+
+  display.setCursor(0, 24);
+  display.printf("Y: %+.1f", yaw);
+
+  display.setCursor(0, 36);
+  display.printf("Throttle: %.0f%%", throttle * 100.0f);
+
+  display.setCursor(0, 48);
+  display.printf("Mag: %s", magnetOn ? "ON" : "OFF");
+
+  display.setCursor(64, 48);
+  display.printf("Arm: %s", armed ? "ON" : "OFF");
+
+  display.display();
+}
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   CRSF.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+
+  pinMode(KILL_SW_PIN,   INPUT_PULLUP);
+  pinMode(MAGNET_SW_PIN, INPUT_PULLUP);
 
   analogReadResolution(12);
   analogSetPinAttenuation(POT_PIN, ADC_11db);
@@ -85,53 +140,96 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
-  if (!mpu.setup(0x68)) {
-    Serial.println("MPU9250 not found — check wiring/address (0x68 or 0x69)");
-    while (1) delay(100);
+  // ── OLED init ───────────────────────────────────────────────────
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 not found — check wiring!");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(20, 24);
+    display.print("Calibrating IMU...");
+    display.display();
   }
 
-  Serial.println("MPU9250 calibrating pls dont move");
-  delay(500);
-  Serial.println("Done. rc[4] = 172 → DISARMED. Change to 1811 to arm.");
+  // ── MPU9250 init ────────────────────────────────────────────────
+  mpu.setup(0x68);
+
+  Serial.println("Calibrating accel & gyro — keep still...");
+  mpu.calibrateAccelGyro();
+
+  Serial.println("Calibrating magnetometer — wave figure-8...");
+  mpu.calibrateMag();
+
+  // ── Capture zero offsets ────────────────────────────────────────
+  Serial.println("Capturing zero offsets — keep still and flat...");
+  float rSum = 0, pSum = 0, ySum = 0;
+  for (int i = 0; i < 500; i++) {
+    mpu.update();
+    rSum += mpu.getPitch();   // physical roll  <- library pitch (axis swap)
+    pSum += mpu.getRoll();    // physical pitch <- library roll  (axis swap)
+    ySum += mpu.getYaw();
+    delay(2);
+  }
+  rollOffset  = rSum  / 500.0f;
+  pitchOffset = pSum  / 500.0f;
+  yawOffset   = ySum  / 500.0f;   // zero yaw to startup heading
+
+  if (fabsf(rollOffset) > 10.0f || fabsf(pitchOffset) > 10.0f) {
+    Serial.printf("WARNING: Large offsets (Roll: %.2f, Pitch: %.2f) — was sensor flat?\n",
+                  rollOffset, pitchOffset);
+  }
+
+  Serial.printf("Offsets — Roll: %.2f  Pitch: %.2f  Yaw: %.2f\n",
+                rollOffset, pitchOffset, yawOffset);
+
+  display.clearDisplay();
+  display.setCursor(20, 28);
+  display.print("  Ready!");
+  display.display();
+  delay(800);
 }
 
 void loop() {
-  // Non-blocking 500 Hz
-  unsigned long now = micros();
-  if (now - lastLoopUs < 2000) return;
-  lastLoopUs = now;
+  unsigned long nowUs = micros();
+  if (nowUs - lastLoopMs < 2000) return;
+  lastLoopMs = nowUs;
 
   mpu.update();
 
- 
-  float roll  = mpu.getRoll();
-  float pitch = mpu.getPitch();
-  float yawRate = mpu.getGyroZ();
-  //Low-pass filter adjust sensitivity at the top 
-  rFilt += LPF_ALPHA * (roll     - rFilt);
-  pFilt += LPF_ALPHA * (pitch    - pFilt);
-  yFilt += LPF_ALPHA * (yawRate  - yFilt);
+  float roll     = mpu.getPitch() - rollOffset;   // axis swap
+  float pitch    = mpu.getRoll()  - pitchOffset;  // axis swap
+  float yaw      = wrapYaw(mpu.getYaw(), yawOffset);  // zeroed & wrapped
 
-  //Throttle
   float throttle = analogRead(POT_PIN) / 4095.0f;
 
-  //Pack channels pls look at RC
-  rc[0] = mapWithDeadband(rFilt, ROLL_MAX);     // Roll
-  rc[1] = mapWithDeadband(pFilt, PITCH_MAX);    // Pitch
-  rc[2] = map((long)(throttle * 1000), 0, 1000, 172, 1811); // Throttle
-  rc[3] = mapWithDeadband(yFilt, YAW_RATE_MAX); // Yaw
-  rc[4] = 172;   // AUX1 --> DISARMED.  Need to change to 1811 to arm
-  for (int i = 5; i < 16; i++) rc[i] = 992;
+  bool armed    = (digitalRead(KILL_SW_PIN)   == LOW);
+  bool magnetOn = (digitalRead(MAGNET_SW_PIN) == LOW);
+
+  rc[0] = mapWithDeadband(roll,  ROLL_MAX);
+  rc[1] = mapWithDeadband(pitch, PITCH_MAX);
+  rc[2] = (uint16_t)map((long)(throttle * 1000), 0, 1000, 172, 1811);
+  rc[3] = mapWithDeadband(yaw,   YAW_MAX);
+  rc[4] = armed    ? 1811 : 172;
+  rc[5] = magnetOn ? 1811 : 172;
+  for (int i = 6; i < 16; i++) rc[i] = 992;
 
   sendCRSF();
 
-  // ── Debug print ──
-  if (millis() - lastPrintMs > PRINT_INTERVAL_MS) {
-    lastPrintMs = millis();
-    Serial.printf("Angle R/P: %5.1f / %5.1f  YawRate: %6.1f  "
-                  "Thr: %4.1f%%  RC: %4u %4u %4u %4u\n",
-                  rFilt, pFilt, yFilt,
-                  throttle * 100.0f,
-                  rc[0], rc[1], rc[2], rc[3]);
+  // ── OLED refresh every 1.5 s ────────────────────────────────────
+  unsigned long nowMs = millis();
+  if (nowMs - lastOledMs >= OLED_UPDATE_MS) {
+    lastOledMs = nowMs;
+    updateOLED(roll, pitch, yaw, throttle, armed, magnetOn);
+  }
+
+  // ── Serial debug ────────────────────────────────────────────────
+  if (nowMs - lastPrintMs > PRINT_INTERVAL_MS) {
+    lastPrintMs = nowMs;
+    Serial.printf("R:%5.1f P:%5.1f Y:%6.1f  Thr:%4.1f%%  RC:%4u %4u %4u %4u  AUX1:%s  AUX2:%s\n",
+                  roll, pitch, yaw, throttle * 100.0f,
+                  rc[0], rc[1], rc[2], rc[3],
+                  armed    ? "ARMED"  : "DISARMED",
+                  magnetOn ? "MAG-ON" : "MAG-OFF");
   }
 }
