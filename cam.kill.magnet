@@ -1,0 +1,297 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU9250.h>
+#include <U8g2lib.h>
+
+
+#define POT_PIN            34
+#define CRSF_TX_PIN        17
+#define CRSF_RX_PIN        16
+#define CRSF_BAUD          420000
+#define PRINT_INTERVAL_MS  50
+#define OLED_UPDATE_MS     1500
+#define CRSF_INTERVAL_US   2000   
+
+#define ROLL_MAX           45.0f
+#define PITCH_MAX          45.0f
+#define YAW_MAX            180.0f
+#define DEADBAND           1.5f
+#define YAW_NOISE_DEADBAND 1.0f 
+
+
+#define KILL_SW_PIN        32
+#define MAGNET_SW_PIN      33
+
+// 3 Way Camera Switch Pins
+#define CAM_SW_PIN_A       25 // just interchange as needed 
+#define CAM_SW_PIN_B       26 
+
+#define SWAP_ROLL_PITCH    true
+#define INVERT_ROLL        false
+#define INVERT_PITCH       false
+#define INVERT_YAW         false
+
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+MPU9250 mpu;
+HardwareSerial CRSF(2);
+#define CRSF_ADDR_MODULE                  0xEE
+#define CRSF_FRAMETYPE_RC_CHANNELS_PACKED 0x16
+
+uint16_t rc[16];
+
+unsigned long lastPrintMs = 0;
+unsigned long lastOledMs  = 0;
+unsigned long lastCrsfUs  = 0;
+unsigned long lastYawUs   = 0;
+
+float offsetRoll  = 0.0f;
+float offsetPitch = 0.0f;
+float offsetYaw   = 0.0f;
+
+float customYaw = 0.0f;
+float gyroZBias = 0.0f;
+
+float wrap180(float angle) {
+  while (angle >  180.0f) angle -= 360.0f;
+  while (angle < -180.0f) angle += 360.0f;
+  return angle;
+}
+uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *ptr++;
+    for (uint8_t i = 0; i < 8; i++)
+      crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : (crc << 1);
+  }
+  return crc;
+}
+
+void crsf_pack_channels(uint8_t *payload) {
+  uint32_t bitbuf = 0;
+  uint8_t bits = 0, idx = 0;
+  for (int ch = 0; ch < 16; ch++) {
+    bitbuf |= ((uint32_t)rc[ch]) << bits;
+    bits += 11;
+    while (bits >= 8) {
+      payload[idx++] = bitbuf & 0xFF;
+      bitbuf >>= 8;
+      bits -= 8;
+    }
+  }
+}
+
+void sendCRSF() {
+  uint8_t payload[22], frame[26];
+  crsf_pack_channels(payload);
+  frame[0] = CRSF_ADDR_MODULE;
+  frame[1] = 24;
+  frame[2] = CRSF_FRAMETYPE_RC_CHANNELS_PACKED;
+  memcpy(&frame[3], payload, 22);
+  frame[25] = crsf_crc8(&frame[2], 23);
+  CRSF.write(frame, 26);
+}
+
+uint16_t mapToCRSF(float v, float minV, float maxV) {
+  v = constrain(v, minV, maxV);
+  return (uint16_t)map((long)(v * 1000), (long)(minV * 1000),
+                       (long)(maxV * 1000), 172, 1811);
+}
+
+uint16_t mapWithDeadband(float v, float maxV) {
+  if (fabsf(v) < DEADBAND) return 992;
+  float sign = (v > 0) ? 1.0f : -1.0f;
+  v = sign * (fabsf(v) - DEADBAND);
+  return mapToCRSF(v, -(maxV - DEADBAND), (maxV - DEADBAND));
+}
+
+const char* getCamSwitchState(uint16_t &crsfVal) {
+  if (digitalRead(CAM_SW_PIN_A) == LOW) {
+    crsfVal = 1811;  
+    return "Cam 1 ";
+  } else if (digitalRead(CAM_SW_PIN_B) == LOW) {
+    crsfVal = 172;   
+    return "Cam 2 ";
+  } else {
+    crsfVal = 992;   
+    return "Possibly cam 3?";
+  }
+}
+
+void updateOLED(float roll, float pitch, float yaw, float throttle, bool armed, bool magnetOn, const char* camState) {
+  char buf[32];
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  snprintf(buf, sizeof(buf), "R: %+.1f", roll); u8g2.drawStr(0, 10, buf);
+  snprintf(buf, sizeof(buf), "P: %+.1f", pitch); u8g2.drawStr(0, 22, buf);
+  snprintf(buf, sizeof(buf), "Y: %+.1f", yaw); u8g2.drawStr(0, 34, buf);
+  
+  snprintf(buf, sizeof(buf), "Thr:%.0f%%", throttle * 100.0f); u8g2.drawStr(0, 46, buf);
+  snprintf(buf, sizeof(buf), "Cam:%s", camState); u8g2.drawStr(70, 46, buf);
+
+  snprintf(buf, sizeof(buf), "Mag:%s", magnetOn ? "ON" : "OFF"); u8g2.drawStr(0, 58, buf);
+  snprintf(buf, sizeof(buf), "Arm:%s", armed ? "ON" : "OFF"); u8g2.drawStr(70, 58, buf);
+
+  u8g2.sendBuffer();
+}
+
+void getAdjustedRPY(float &r, float &p, float &y) {
+  float rawR = mpu.getRoll();
+  float rawP = mpu.getPitch();
+
+  r = SWAP_ROLL_PITCH ? rawP : rawR;
+  p = SWAP_ROLL_PITCH ? rawR : rawP;
+  y = customYaw;
+
+  if (INVERT_ROLL)  r = -r;
+  if (INVERT_PITCH) p = -p;
+  if (INVERT_YAW)   y = -y;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  CRSF.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+
+  pinMode(KILL_SW_PIN,   INPUT_PULLUP);
+  pinMode(MAGNET_SW_PIN, INPUT_PULLUP);
+
+  pinMode(CAM_SW_PIN_A,  INPUT_PULLUP);
+  pinMode(CAM_SW_PIN_B,  INPUT_PULLUP);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(10, 32, "Init MPU9250...");
+  u8g2.sendBuffer();
+
+  if (!mpu.setup(0x68)) {
+    Serial.println("MPU9250 FAIL");
+    u8g2.clearBuffer(); u8g2.drawStr(0, 32, "MPU9250 FAIL"); u8g2.sendBuffer();
+    while (1) delay(100);
+  }
+
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 22, "Calibrating...");
+  u8g2.drawStr(0, 34, "Keep Still!");
+  u8g2.sendBuffer();
+
+  mpu.calibrateAccelGyro();
+
+  float zSum = 0;
+  for (int i = 0; i < 500; i++) {
+    mpu.update();
+    zSum += mpu.getGyroZ();
+    delay(2);
+  }
+  gyroZBias = zSum / 500.0f;
+
+  float sumR = 0, sumP = 0;
+  for (int i = 0; i < 200; i++) {
+    mpu.update(); 
+    float r, p, y;
+    getAdjustedRPY(r, p, y);
+    sumR += r; sumP += p; 
+    delay(2);
+  }
+  offsetRoll  = sumR / 200.0f;
+  offsetPitch = sumP / 200.0f;
+  offsetYaw   = 0.0f; 
+
+  u8g2.clearBuffer();
+  u8g2.drawStr(35, 32, "Ready!");
+  u8g2.sendBuffer();
+  delay(600);
+
+  lastYawUs = micros(); 
+}
+
+void loop() {
+  unsigned long nowUs = micros();
+  unsigned long nowMs = millis();
+
+  mpu.update();
+
+  float dt = (nowUs - lastYawUs) / 1000000.0f;
+  lastYawUs = nowUs;
+
+  float gz = mpu.getGyroZ() - gyroZBias;
+
+  if (abs(gz) > YAW_NOISE_DEADBAND) {
+    customYaw -= gz * dt; 
+    customYaw = wrap180(customYaw);
+  }
+
+  if (nowUs - lastCrsfUs >= CRSF_INTERVAL_US) {
+    lastCrsfUs = nowUs;
+
+    float r, p, y;
+    getAdjustedRPY(r, p, y);
+
+    float outRoll  = r - offsetRoll;
+    float outPitch = p - offsetPitch;
+    float outYaw   = wrap180(y - offsetYaw);
+
+    float throttle = analogRead(POT_PIN) / 4095.0f;
+    bool armed    = (digitalRead(KILL_SW_PIN)   == LOW);
+    bool magnetOn = (digitalRead(MAGNET_SW_PIN) == LOW);
+
+    uint16_t camCrsfVal;
+    getCamSwitchState(camCrsfVal);
+
+    rc[0] = mapWithDeadband(outRoll,  ROLL_MAX);
+    rc[1] = mapWithDeadband(outPitch, PITCH_MAX);
+    rc[2] = (uint16_t)map((long)(throttle * 1000), 0, 1000, 172, 1811);
+    rc[3] = mapWithDeadband(outYaw,   YAW_MAX);
+    
+    rc[4] = armed    ? 1811 : 172;   
+    rc[5] = magnetOn ? 1811 : 172;   
+    rc[6] = camCrsfVal;              
+    
+    for (int i = 7; i < 16; i++) rc[i] = 992; 
+
+    sendCRSF();
+  }
+
+  if (nowMs - lastOledMs >= OLED_UPDATE_MS) {
+    lastOledMs = nowMs;
+    float r, p, y;
+    getAdjustedRPY(r, p, y);
+    float throttle = analogRead(POT_PIN) / 4095.0f;
+    bool armed    = (digitalRead(KILL_SW_PIN)   == LOW);
+    bool magnetOn = (digitalRead(MAGNET_SW_PIN) == LOW);
+    
+    uint16_t camCrsfVal;
+    const char* camState = getCamSwitchState(camCrsfVal);
+    
+    updateOLED(r - offsetRoll, p - offsetPitch, wrap180(y - offsetYaw), throttle, armed, magnetOn, camState);
+  }
+
+  if (nowMs - lastPrintMs > PRINT_INTERVAL_MS) {
+    lastPrintMs = nowMs;
+    float r, p, y;
+    getAdjustedRPY(r, p, y);
+    
+    float throttle = analogRead(POT_PIN) / 4095.0f;
+    bool armed     = (digitalRead(KILL_SW_PIN)   == LOW);
+    bool magnetOn  = (digitalRead(MAGNET_SW_PIN) == LOW);
+    
+    uint16_t camCrsfVal;
+    const char* camState = getCamSwitchState(camCrsfVal);
+
+    
+    Serial.printf("R:%6.1f P:%6.1f Y:%7.1f Thr:%5.1f%% Arm:%3s Mag:%3s Cam:%s\n",
+                  r - offsetRoll, p - offsetPitch, wrap180(y - offsetYaw), 
+                  throttle * 100.0f, 
+                  armed ? "ON " : "OFF", 
+                  magnetOn ? "ON " : "OFF", 
+                  camState);
+  }
+}
