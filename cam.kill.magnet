@@ -295,3 +295,18 @@ void loop() {
                   camState);
   }
 }
+/* GPIO 32  → Arm switch → GND
+GPIO 33  → Magnet switch → GND
+GPIO 25  → Cam switch A → GND
+GPIO 26  → Cam switch B → GND
+GPIO 34  → Throttle pot (wiper), pot outer legs → 3.3V and GND
+GPIO 17  → CRSF module RX
+GPIO 16  → CRSF module TX
+GPIO 21  → SDA (MPU9250 + OLED)
+GPIO 22  → SCL (MPU9250 + OLED)
+MPU9250 AD0 → GND (sets I2C address to 0x68)
+MPU9250 VCC → 3.3V
+MPU9250 GND → GND
+OLED VCC → 3.3V
+OLED GND → GND
+CRSF module GND → GND *\
